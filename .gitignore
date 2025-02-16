@@ -1,0 +1,5 @@
+.vs
+*.vcxproj.*
+x64
+WindowBuilder
+vcpkg_installed
