@@ -1,6 +1,7 @@
 # WindowBuilder
 
 Extremely simple Windows DX11 helper library for making windows with libraries integrated. 
+Made simply to speed up the process of creating windows with libraries like ImGui, Dear ImGui, etc when making applications/tools.
 
 ## Example usage
 ```cpp

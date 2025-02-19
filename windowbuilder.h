@@ -1,49 +1,122 @@
 #pragma once
 
 #pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dwmapi.lib")
 
-#include <vector>
-#include <memory>
 #include <functional>
 #include <iostream>
+#include <cstring>
+#include <cassert>
+#include <vector>
+#include <memory>
+#include <array>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <d3d11.h>
+#include <dwmapi.h>
 
+// Forward declarations
 class Window;
+class WBPlugin;
 
+// A simple configuration struct for window properties.
+struct WindowConfig {
+	const char* title = "Window";
+	const char* className = "WindowClass";
+	std::array<float, 4> clearColor = { 0.0f, 0.0f, 0.0f, 1.0f };
+	int width = 800;
+	int height = 600;
+	bool useImmersiveTitlebar = true;
+	std::function<void(Window&)> onResize = nullptr;
+	std::function<void(Window&)> onClose = nullptr;
+	std::function<void(Window&)> onRender = nullptr;
+	std::vector<std::unique_ptr<WBPlugin>> plugins;
+};
+
+/// <summary>
+/// Base plugin class that can be used to extend the window functionality.
+/// </summary>
 class WBPlugin {
 public:
+	/// <summary>
+	/// Destructor.
+	/// </summary>
 	virtual ~WBPlugin() = default;
 
+	/// <summary>
+	/// Called when the plugin is loaded.
+	/// </summary>
+	/// <param name="window">The window instance.</param>
 	virtual void OnLoad(Window&) {}
+
+	/// <summary>
+	/// Called when the plugin is unloaded.
+	/// </summary>
+	/// <param name="window">The window instance.</param>
 	virtual void OnUnload(Window&) {}
 
+	/// <summary>
+	/// Called before the window is rendered.
+	/// </summary>
+	/// <param name="window">The window instance.</param>
 	virtual void PreRender(Window&) {}
+
+	/// <summary>
+	/// Called after the window is rendered but before the swap chain is presented.
+	/// </summary>
+	/// <param name="window">The window instance.</param>
 	virtual void PostRender(Window&) {}
 
+	/// <summary>
+	/// Called when the window receives a message but previous handlers have not processed it.
+	/// </summary>
+	/// <param name="window">The window instance.</param>
+	/// <param name="msg">The message ID.</param>
+	/// <param name="wParam">The WPARAM parameter.</param>
+	/// <param name="lParam">The LPARAM parameter.</param>
 	virtual void HandleMessage(Window&, UINT, WPARAM, LPARAM) {}
 };
 
+/// <summary>
+/// A fully built an presentable window.
+/// </summary>
 class Window {
 public:
+	// Delete copy operations
+	Window(const Window&) = delete;
+	Window& operator=(const Window&) = delete;
+
+	// Allow move semantics if needed
+	Window(Window&&) = default;
+	Window& operator=(Window&&) = default;
+
+	~Window() {
+		if (renderTargetView) renderTargetView->Release();
+		if (swapChain) swapChain->Release();
+		if (context) context->Release();
+		if (device) device->Release();
+	}
+
 	/// <summary>
-	/// Begin rendering loop
+	/// Shows the window and enters the message loop.
 	/// </summary>
 	void Show() {
 		MSG msg = {};
 		while (msg.message != WM_QUIT) {
-			if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+			if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
 				TranslateMessage(&msg);
 				DispatchMessage(&msg);
 			}
 			else {
-				context->ClearRenderTargetView(renderTargetView, this->clearColor);
+				context->ClearRenderTargetView(renderTargetView, clearColor.data());
 
 				for (auto& plugin : plugins)
 					plugin->PreRender(*this);
-				onRender(*this);
+
+				if (onRender)
+					onRender(*this);
+
 				for (auto& plugin : plugins)
 					plugin->PostRender(*this);
 
@@ -55,27 +128,22 @@ public:
 			plugin->OnUnload(*this);
 	}
 
-	Window(const char* title, const char* className, float clearColor[4], int width, int height, std::function<void(Window&)> onResize = nullptr, std::function<void(Window&)> onClose = nullptr, std::function<void(Window&)> onRender = nullptr, std::vector<std::unique_ptr<WBPlugin>> plugins = {}) {
-		this->title = title;
-		this->className = className;
-		this->plugins = std::move(plugins);
-
-		this->width = width;
-		this->height = height;
-
-		memcpy(this->clearColor, clearColor, sizeof(float) * 4);
-
-		if (onResize) this->onResize = onResize;
-		if (onClose) this->onClose = onClose;
-		if (onRender) this->onRender = onRender;
-
-		this->renderTargetView = nullptr;
-
+	explicit Window(WindowConfig config)
+		: width(config.width),
+		height(config.height),
+		title(config.title),
+		className(config.className),
+		clearColor(config.clearColor),
+		onResize(config.onResize ? config.onResize : defaultOnResize),
+		onClose(config.onClose ? config.onClose : defaultOnClose),
+		onRender(config.onRender ? config.onRender : defaultOnRender),
+		plugins(std::move(config.plugins)),
+		useImmersiveTitlebar(config.useImmersiveTitlebar)
+	{
 		// Register window class
 		WNDCLASS wc = {};
 		wc.lpfnWndProc = WndProc;
 		wc.hInstance = GetModuleHandle(NULL);
-
 #ifdef UNICODE
 		wchar_t wClassName[256];
 		swprintf(wClassName, 256, L"%hs", className);
@@ -83,22 +151,54 @@ public:
 #else
 		wc.lpszClassName = className;
 #endif
-
 		RegisterClass(&wc);
 
-		HWND hWnd;
+		// Create window
+		HWND hWnd = nullptr;
 #ifdef UNICODE
 		wchar_t wTitle[256];
 		swprintf(wTitle, 256, L"%hs", title);
-		hWnd = CreateWindow(wClassName, wTitle, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, width, height, NULL, NULL, GetModuleHandle(NULL), NULL);
+		hWnd = CreateWindow(wClassName, wTitle, WS_OVERLAPPEDWINDOW,
+			CW_USEDEFAULT, CW_USEDEFAULT, width, height,
+			NULL, NULL, GetModuleHandle(NULL), NULL);
 #else
-		hWnd = CreateWindow(className, title, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, width, height, NULL, NULL, GetModuleHandle(NULL), NULL);
+		hWnd = CreateWindow(className, title, WS_OVERLAPPEDWINDOW,
+			CW_USEDEFAULT, CW_USEDEFAULT, width, height,
+			NULL, NULL, GetModuleHandle(NULL), NULL);
 #endif
 
+		// Associate this Window instance with the HWND
 		SetWindowLongPtr(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
-
 		this->hWnd = hWnd;
 		this->hInstance = GetModuleHandle(NULL);
+
+		// Optionally enable an immersive (e.g., dark mode) titlebar
+		if (useImmersiveTitlebar) {
+			HKEY hKey = nullptr;
+			if (RegOpenKeyEx(HKEY_CURRENT_USER,
+#ifdef UNICODE
+				L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+#else
+				"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+#endif
+				0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+				DWORD value = 0;
+				DWORD size = sizeof(DWORD);
+				if (RegQueryValueEx(hKey,
+#ifdef UNICODE
+					L"AppsUseLightTheme",
+#else
+					"AppsUseLightTheme",
+#endif
+					NULL, NULL,
+					reinterpret_cast<LPBYTE>(&value), &size) == ERROR_SUCCESS) {
+					BOOL dark = value == 0;
+					DwmSetWindowAttribute(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+						&dark, sizeof(BOOL));
+				}
+				RegCloseKey(hKey);
+			}
+		}
 
 		// Create DX11 device and swap chain
 		DXGI_SWAP_CHAIN_DESC scd = {};
@@ -114,206 +214,155 @@ public:
 		scd.SampleDesc.Quality = 0;
 		scd.Windowed = TRUE;
 
-		HRESULT res = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &scd, &swapChain, &device, NULL, &context);
+		HRESULT res = D3D11CreateDeviceAndSwapChain(
+			nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+			nullptr, 0, D3D11_SDK_VERSION, &scd,
+			&swapChain, &device, nullptr, &context);
 		if (res != S_OK) {
 			std::cerr << "Failed to create device and swap chain" << std::endl;
-
-			// Get result string
-			char* error = nullptr;
-			FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, res, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&error, 0, NULL);
-			std::cerr << error << std::endl;
-
+			LPSTR errorMsg = nullptr;
+			FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+				FORMAT_MESSAGE_IGNORE_INSERTS,
+				nullptr, res, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+				reinterpret_cast<LPSTR>(&errorMsg), 0, nullptr);
+			std::cerr << errorMsg << std::endl;
+			LocalFree(errorMsg);
 			return;
 		}
 
-		// Get back buffer
-		ID3D11Texture2D* backBuffer;
-		swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backBuffer);
-		device->CreateRenderTargetView(backBuffer, NULL, &renderTargetView);
+		// Create render target view
+		ID3D11Texture2D* backBuffer = nullptr;
+		swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D),
+			reinterpret_cast<void**>(&backBuffer));
+		assert(backBuffer != nullptr);
+		device->CreateRenderTargetView(backBuffer, nullptr, &renderTargetView);
 		backBuffer->Release();
 
-		// Show window
 		ShowWindow(hWnd, SW_SHOW);
 		UpdateWindow(hWnd);
-		
-		// Set target view
-		context->OMSetRenderTargets(1, &renderTargetView, NULL);
 
-		for (auto& plugin : this->plugins) {
+		context->OMSetRenderTargets(1, &renderTargetView, nullptr);
+
+		// Notify plugins that the window has loaded
+		for (auto& plugin : plugins)
 			plugin->OnLoad(*this);
-		}
 	}
 
-public:
-	// Hide constructor, copy, and assignment operator
-	Window() = delete;
-	Window(const Window&) = delete;
-	Window& operator=(const Window&) = delete;
+	// DX11/Win32 objects
+	ID3D11Device* device = nullptr;
+	ID3D11DeviceContext* context = nullptr;
+	IDXGISwapChain* swapChain = nullptr;
+	ID3D11RenderTargetView* renderTargetView = nullptr;
+	HINSTANCE hInstance = nullptr;
+	HWND hWnd = nullptr;
 
-	// DX11 stuff
-	ID3D11Device* device;
-	ID3D11DeviceContext* context;
-	IDXGISwapChain* swapChain;
-	ID3D11RenderTargetView* renderTargetView;
-
-	// Win32 stuff
-	HWND hWnd;
-	HINSTANCE hInstance;
-
-	// window properties (updated whenever needed)
+	// Window properties
 	int width = 800;
 	int height = 600;
 	const char* title = "Window";
 	const char* className = "WindowClass";
-	float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-
-	std::function<void(Window&)> onResize = [](Window& window) {
-		// Resize buffers
-		window.context->OMSetRenderTargets(0, 0, 0);
-		window.renderTargetView->Release();
-
-		window.swapChain->ResizeBuffers(0, window.width, window.height, DXGI_FORMAT_UNKNOWN, 0);
-
-		ID3D11Texture2D* backBuffer = nullptr;
-		window.swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backBuffer);
-		window.device->CreateRenderTargetView(backBuffer, NULL, &window.renderTargetView);
-		backBuffer->Release();
-		};
-	std::function<void(Window&)> onClose = [](Window&) {
-		PostQuitMessage(0);
-		};
-	std::function<void(Window&)> onRender = [](Window&) {};
-
+	std::array<float, 4> clearColor = { 0.0f, 0.0f, 0.0f, 1.0f };
+	std::function<void(Window&)> onResize = defaultOnResize;
+	std::function<void(Window&)> onClose = defaultOnClose;
+	std::function<void(Window&)> onRender = defaultOnRender;
 	std::vector<std::unique_ptr<WBPlugin>> plugins = {};
+	bool useImmersiveTitlebar = false;
 
-	// window procedure
+	// Window procedure
 	static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
 		Window* window = reinterpret_cast<Window*>(GetWindowLongPtr(hWnd, GWLP_USERDATA));
-		switch (message) {
-		case WM_SIZE:
-			window->width = LOWORD(lParam);
-			window->height = HIWORD(lParam);
-			window->onResize(*window);
+		if (window) {
+			switch (message) {
+			case WM_SIZE:
+				window->width = LOWORD(lParam);
+				window->height = HIWORD(lParam);
+				if (window->onResize)
+					window->onResize(*window);
+				break;
+			case WM_CLOSE:
+				if (window->onClose)
+					window->onClose(*window);
+				break;
+			}
 
-			break;
-		case WM_CLOSE:
-			window->onClose(*window);
-			break;
-		}
-
-		if (window)
-		for (auto& plugin : window->plugins) {
-			plugin->HandleMessage(*window, message, wParam, lParam);
+			for (auto& plugin : window->plugins)
+				plugin->HandleMessage(*window, message, wParam, lParam);
 		}
 
 		return DefWindowProc(hWnd, message, wParam, lParam);
 	}
+
+private:
+	// Default callback implementations
+	static void defaultOnResize(Window& window) {
+		window.context->OMSetRenderTargets(0, nullptr, nullptr);
+		if (window.renderTargetView) {
+			window.renderTargetView->Release();
+			window.renderTargetView = nullptr;
+		}
+		window.swapChain->ResizeBuffers(0, window.width, window.height, DXGI_FORMAT_UNKNOWN, 0);
+		ID3D11Texture2D* backBuffer = nullptr;
+		window.swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D),
+			reinterpret_cast<void**>(&backBuffer));
+		window.device->CreateRenderTargetView(backBuffer, nullptr, &window.renderTargetView);
+		backBuffer->Release();
+	}
+	static void defaultOnClose(Window&) {
+		PostQuitMessage(0);
+	}
+	static void defaultOnRender(Window&) {}
 };
 
+// A builder class for creating a Window.
 class WindowBuilder {
 public:
-	WindowBuilder() = default;
+	WindowBuilder() {}
 
-	/// <summary>
-	/// Set window title and class name
-	/// </summary>
-	/// <param name="title">Title of the window</param>
-	/// <param name="className">Class name of the window</param>
-	/// <returns></returns>
 	WindowBuilder& Name(const char* title, const char* className = "WindowClass") {
-		this->title = title;
+		config.title = title;
+		config.className = className;
 		return *this;
 	}
-
-	/// <summary>
-	/// Set window size
-	/// </summary>
-	/// <param name="width">Width of the window</param>
-	/// <param name="height">Height of the window</param>
-	/// <returns></returns>
 	WindowBuilder& Size(int width, int height) {
-		this->width = width;
-		this->height = height;
+		config.width = width;
+		config.height = height;
 		return *this;
 	}
-
-	/// <summary>
-	/// Set clear color of the window
-	/// </summary>
-	/// <param name="r">Red component of the color</param>
-	/// <param name="g">Green component of the color</param>
-	/// <param name="b">Blue component of the color</param>
-	/// <param name="a">Alpha component of the color</param>
-	/// <returns></returns>
 	WindowBuilder& ClearColor(float r, float g, float b, float a) {
-		this->clearColor[0] = r;
-		this->clearColor[1] = g;
-		this->clearColor[2] = b;
-		this->clearColor[3] = a;
+		config.clearColor = { r, g, b, a };
 		return *this;
 	}
-
-	/// <summary>
-	/// Set resize callback
-	/// </summary>
-	/// <param name="onResize">Callback function</param>
-	/// <returns></returns>
 	WindowBuilder& OnResize(std::function<void(Window&)> onResize) {
-		this->onResize = onResize;
+		config.onResize = onResize;
 		return *this;
 	}
-
-	/// <summary>
-	/// Set close callback
-	/// </summary>
-	/// <param name="onClose">Callback function</param>
-	/// <returns></returns>
 	WindowBuilder& OnClose(std::function<void(Window&)> onClose) {
-		this->onClose = onClose;
+		config.onClose = onClose;
 		return *this;
 	}
-
-	/// <summary>
-	/// Set render callback
-	/// </summary>
-	/// <param name="onRender">Callback function</param>
-	/// <returns></returns>
 	WindowBuilder& OnRender(std::function<void(Window&)> onRender) {
-		this->onRender = onRender;
+		config.onRender = onRender;
+		return *this;
+	}
+	WindowBuilder& ImmersiveTitlebar(bool useImmersiveTitlebar = true) {
+		config.useImmersiveTitlebar = useImmersiveTitlebar;
 		return *this;
 	}
 
-	/// <summary>
-	/// Add plugin to the window
-	/// </summary>
-	/// <typeparam name="T">Type of the plugin</typeparam>
-	/// <returns></returns>
 	template<typename T>
 	WindowBuilder& Plugin() {
-		this->plugins.emplace_back(std::make_unique<T>());
+		config.plugins.emplace_back(std::make_unique<T>());
 		return *this;
 	}
 
 	/// <summary>
-	/// Build window
+	/// Creates a new Window instance with the current configuration.
 	/// </summary>
-	/// <returns>A window object</returns>
-	Window Build() {
-		return Window(title, className, clearColor, width, height, onResize, onClose, onRender, std::move(plugins));
+	/// <returns>The new Window instance, heap-allocated with a unique pointer.</returns>
+	std::unique_ptr<Window> Build() {
+		return std::make_unique<Window>(std::move(config));
 	}
 
 private:
-	// window properties
-	int width = 800;
-	int height = 600;
-	const char* title = "Window";
-	const char* className = "WindowClass";
-
-	std::function<void(Window&)> onResize = nullptr;
-	std::function<void(Window&)> onRender = nullptr;
-	std::function<void(Window&)> onClose = nullptr;
-
-	float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-
-	std::vector<std::unique_ptr<WBPlugin>> plugins;
+	WindowConfig config;
 };

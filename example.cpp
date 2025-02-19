@@ -8,14 +8,14 @@ static void Render(Window& window) {
 }
 
 int main(void) {
-	Window window = WindowBuilder()
+	auto window = WindowBuilder()
 		.Name("My Window", "MyWindowClass")
 		.Plugin<WindowBuilderImGui>()
 		.Size(1280, 720)
 		.OnRender(Render)
 		.Build();
 
-	window.Show();
+	window->Show();
 
 	return 0;
 }
