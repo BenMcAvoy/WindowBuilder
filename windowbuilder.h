@@ -295,17 +295,14 @@ public:
 private:
 	// Default callback implementations
 	static void defaultOnResize(Window& window) {
-		window.context->OMSetRenderTargets(0, nullptr, nullptr);
-		if (window.renderTargetView) {
-			window.renderTargetView->Release();
-			window.renderTargetView = nullptr;
-		}
+		if (window.renderTargetView) window.renderTargetView->Release();
 		window.swapChain->ResizeBuffers(0, window.width, window.height, DXGI_FORMAT_UNKNOWN, 0);
 		ID3D11Texture2D* backBuffer = nullptr;
 		window.swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D),
 			reinterpret_cast<void**>(&backBuffer));
 		window.device->CreateRenderTargetView(backBuffer, nullptr, &window.renderTargetView);
 		backBuffer->Release();
+		window.context->OMSetRenderTargets(1, &window.renderTargetView, nullptr);
 	}
 	static void defaultOnClose(Window&) {
 		PostQuitMessage(0);
