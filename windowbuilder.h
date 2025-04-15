@@ -28,6 +28,7 @@ struct WindowConfig {
 	int width = 800;
 	int height = 600;
 	bool useImmersiveTitlebar = true;
+	bool vsync = false; // Pd9ba
 	std::function<void(Window&)> onResize = nullptr;
 	std::function<void(Window&)> onClose = nullptr;
 	std::function<void(Window&)> onRender = nullptr;
@@ -120,7 +121,7 @@ public:
 				for (auto& plugin : plugins)
 					plugin->PostRender(*this);
 
-				swapChain->Present(0, 0);
+				swapChain->Present(vsync ? 1 : 0, 0); // P953f
 			}
 		}
 
@@ -138,7 +139,8 @@ public:
 		onClose(config.onClose ? config.onClose : defaultOnClose),
 		onRender(config.onRender ? config.onRender : defaultOnRender),
 		plugins(std::move(config.plugins)),
-		useImmersiveTitlebar(config.useImmersiveTitlebar)
+		useImmersiveTitlebar(config.useImmersiveTitlebar),
+		vsync(config.vsync) // P953f
 	{
 		// Register window class
 		WNDCLASS wc = {};
@@ -267,6 +269,7 @@ public:
 	std::function<void(Window&)> onRender = defaultOnRender;
 	std::vector<std::unique_ptr<WBPlugin>> plugins = {};
 	bool useImmersiveTitlebar = false;
+	bool vsync = false; // P953f
 
 	// Window procedure
 	static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -343,6 +346,10 @@ public:
 	}
 	WindowBuilder& ImmersiveTitlebar(bool useImmersiveTitlebar = true) {
 		config.useImmersiveTitlebar = useImmersiveTitlebar;
+		return *this;
+	}
+	WindowBuilder& VSync(bool vsync = true) { // P8b76
+		config.vsync = vsync;
 		return *this;
 	}
 

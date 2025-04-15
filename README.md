@@ -20,6 +20,7 @@ int main(void) {
 		.Plugin<WindowBuilderImGui>()
 		.OnRender(Render)
 		.Size(1280, 720)
+		.VSync(true) // Enable vsync
 		.Build();
 
 	window.Show();
