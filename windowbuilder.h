@@ -258,6 +258,22 @@ public:
 		return takeFocus;
 	}
 
+	/// <summary>
+	/// Checks if this window is in overlay mode.
+	/// </summary>
+	/// <returns>True if overlay mode is active, false otherwise</returns>
+	bool IsOverlay() const {
+		return isOverlay;
+	}
+
+	/// <summary>
+	/// Gets the handle of the target window being overlaid (if any).
+	/// </summary>
+	/// <returns>Target window handle, or nullptr if not in overlay mode</returns>
+	HWND GetTargetWindow() const {
+		return isOverlay ? targetWindow : nullptr;
+	}
+
 	explicit Window(WindowConfig config)
 		: width(config.width),
 		height(config.height),
@@ -545,25 +561,32 @@ private:
 		PSYSTEM_PROCESS_INFORMATION processInfo = 
 			reinterpret_cast<PSYSTEM_PROCESS_INFORMATION>(buffer.data());
 
+		BYTE* bufferEnd = buffer.data() + buffer.size();
+		
 		while (processInfo->NextEntryOffset != 0) {
 			if (processInfo->ImageName.Buffer) {
 				// Convert UNICODE_STRING to char*
 				int len = WideCharToMultiByte(CP_UTF8, 0, processInfo->ImageName.Buffer, 
 					processInfo->ImageName.Length / sizeof(WCHAR), nullptr, 0, nullptr, nullptr);
-				std::vector<char> processNameBuffer(len + 1);
-				WideCharToMultiByte(CP_UTF8, 0, processInfo->ImageName.Buffer, 
-					processInfo->ImageName.Length / sizeof(WCHAR), 
-					processNameBuffer.data(), len, nullptr, nullptr);
-				processNameBuffer[len] = '\0';
+				if (len > 0) {
+					std::vector<char> processNameBuffer(len + 1);
+					WideCharToMultiByte(CP_UTF8, 0, processInfo->ImageName.Buffer, 
+						processInfo->ImageName.Length / sizeof(WCHAR), 
+						processNameBuffer.data(), len, nullptr, nullptr);
+					processNameBuffer[len] = '\0';
 
-				if (strcmp(processNameBuffer.data(), processName) == 0) {
-					DWORD pid = static_cast<DWORD>(reinterpret_cast<uintptr_t>(processInfo->ProcessId));
-					return FindWindowByProcessId(pid);
+					if (strcmp(processNameBuffer.data(), processName) == 0) {
+						DWORD pid = static_cast<DWORD>(reinterpret_cast<uintptr_t>(processInfo->ProcessId));
+						return FindWindowByProcessId(pid);
+					}
 				}
 			}
 
-			processInfo = reinterpret_cast<PSYSTEM_PROCESS_INFORMATION>(
-				reinterpret_cast<BYTE*>(processInfo) + processInfo->NextEntryOffset);
+			// Move to next process info, with bounds checking
+			BYTE* nextPtr = reinterpret_cast<BYTE*>(processInfo) + processInfo->NextEntryOffset;
+			if (nextPtr >= bufferEnd) break; // Prevent buffer overflow
+			
+			processInfo = reinterpret_cast<PSYSTEM_PROCESS_INFORMATION>(nextPtr);
 		}
 
 		return nullptr;
