@@ -22,6 +22,14 @@
 #include <winternl.h>
 #include <psapi.h>
 
+// Status constants for NT API
+#ifndef STATUS_SUCCESS
+#define STATUS_SUCCESS 0x00000000
+#endif
+#ifndef STATUS_INFO_LENGTH_MISMATCH
+#define STATUS_INFO_LENGTH_MISMATCH 0xC0000004
+#endif
+
 // NT API function declarations for avoiding detection
 typedef NTSTATUS(NTAPI* NtQuerySystemInformation_t)(
 	SYSTEM_INFORMATION_CLASS SystemInformationClass,
@@ -124,9 +132,54 @@ public:
 	Window(const Window&) = delete;
 	Window& operator=(const Window&) = delete;
 
-	// Allow move semantics if needed
-	Window(Window&&) = default;
-	Window& operator=(Window&&) = default;
+	// Custom move constructor to handle thread properly
+	Window(Window&& other) noexcept
+		: device(other.device),
+		context(other.context),
+		swapChain(other.swapChain),
+		renderTargetView(other.renderTargetView),
+		hInstance(other.hInstance),
+		hWnd(other.hWnd),
+		width(other.width),
+		height(other.height),
+		title(other.title),
+		className(other.className),
+		clearColor(other.clearColor),
+		onResize(std::move(other.onResize)),
+		onClose(std::move(other.onClose)),
+		onRender(std::move(other.onRender)),
+		plugins(std::move(other.plugins)),
+		useImmersiveTitlebar(other.useImmersiveTitlebar),
+		vsync(other.vsync),
+		isOverlay(other.isOverlay),
+		targetWindow(other.targetWindow),
+		targetProcessName(other.targetProcessName),
+		targetProcessId(other.targetProcessId),
+		takeFocus(other.takeFocus.load()),
+		transparentBackground(other.transparentBackground),
+		trackingThread(std::move(other.trackingThread)),
+		shouldStopTracking(other.shouldStopTracking.load())
+	{
+		// Clear the other object
+		other.device = nullptr;
+		other.context = nullptr;
+		other.swapChain = nullptr;
+		other.renderTargetView = nullptr;
+		other.hWnd = nullptr;
+		other.targetWindow = nullptr;
+	}
+
+	// Custom move assignment
+	Window& operator=(Window&& other) noexcept {
+		if (this != &other) {
+			// Clean up current resources
+			this->~Window();
+			
+			// Move from other
+			new (this) Window(std::move(other));
+		}
+		return *this;
+	}
 
 	~Window() {
 		// Stop tracking thread if running
