@@ -2,6 +2,7 @@
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "ntdll.lib")
 
 #include <functional>
 #include <iostream>
@@ -10,11 +11,38 @@
 #include <vector>
 #include <memory>
 #include <array>
+#include <thread>
+#include <atomic>
+#include <chrono>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <d3d11.h>
 #include <dwmapi.h>
+#include <winternl.h>
+#include <psapi.h>
+
+// NT API function declarations for avoiding detection
+typedef NTSTATUS(NTAPI* NtQuerySystemInformation_t)(
+	SYSTEM_INFORMATION_CLASS SystemInformationClass,
+	PVOID SystemInformation,
+	ULONG SystemInformationLength,
+	PULONG ReturnLength
+);
+
+// Structure for system process information
+typedef struct _SYSTEM_PROCESS_INFORMATION {
+	ULONG NextEntryOffset;
+	ULONG NumberOfThreads;
+	LARGE_INTEGER Reserved[3];
+	LARGE_INTEGER CreateTime;
+	LARGE_INTEGER UserTime;
+	LARGE_INTEGER KernelTime;
+	UNICODE_STRING ImageName;
+	KPRIORITY BasePriority;
+	HANDLE ProcessId;
+	HANDLE InheritedFromProcessId;
+} SYSTEM_PROCESS_INFORMATION, * PSYSTEM_PROCESS_INFORMATION;
 
 // Forward declarations
 class Window;
@@ -33,6 +61,14 @@ struct WindowConfig {
 	std::function<void(Window&)> onClose = nullptr;
 	std::function<void(Window&)> onRender = nullptr;
 	std::vector<std::unique_ptr<WBPlugin>> plugins;
+	
+	// Overlay/attach configuration
+	bool isOverlay = false;
+	HWND targetWindow = nullptr;
+	const char* targetProcessName = nullptr;
+	DWORD targetProcessId = 0;
+	bool takeFocus = false;
+	bool transparentBackground = true;
 };
 
 /// <summary>
@@ -93,6 +129,12 @@ public:
 	Window& operator=(Window&&) = default;
 
 	~Window() {
+		// Stop tracking thread if running
+		if (isOverlay && trackingThread.joinable()) {
+			shouldStopTracking = true;
+			trackingThread.join();
+		}
+
 		if (renderTargetView) renderTargetView->Release();
 		if (swapChain) swapChain->Release();
 		if (context) context->Release();
@@ -125,8 +167,42 @@ public:
 			}
 		}
 
+		// Stop tracking thread if running
+		if (isOverlay && trackingThread.joinable()) {
+			shouldStopTracking = true;
+			trackingThread.join();
+		}
+
 		for (auto& plugin : plugins)
 			plugin->OnUnload(*this);
+	}
+
+	/// <summary>
+	/// Sets whether the overlay window should take focus when clicked.
+	/// Only applies to overlay windows.
+	/// </summary>
+	/// <param name="shouldTakeFocus">True to allow focus, false to remain click-through</param>
+	void SetTakeFocus(bool shouldTakeFocus) {
+		if (!isOverlay) return;
+		
+		takeFocus = shouldTakeFocus;
+		
+		// Update window extended styles
+		LONG_PTR exStyle = GetWindowLongPtr(hWnd, GWL_EXSTYLE);
+		if (shouldTakeFocus) {
+			exStyle &= ~WS_EX_TRANSPARENT;
+		} else {
+			exStyle |= WS_EX_TRANSPARENT;
+		}
+		SetWindowLongPtr(hWnd, GWL_EXSTYLE, exStyle);
+	}
+
+	/// <summary>
+	/// Gets whether the overlay window takes focus when clicked.
+	/// </summary>
+	/// <returns>True if focus is taken, false if click-through</returns>
+	bool GetTakeFocus() const {
+		return takeFocus;
 	}
 
 	explicit Window(WindowConfig config)
@@ -140,8 +216,24 @@ public:
 		onRender(config.onRender ? config.onRender : defaultOnRender),
 		plugins(std::move(config.plugins)),
 		useImmersiveTitlebar(config.useImmersiveTitlebar),
-		vsync(config.vsync) // P953f
+		vsync(config.vsync), // P953f
+		isOverlay(config.isOverlay),
+		targetWindow(config.targetWindow),
+		targetProcessName(config.targetProcessName),
+		targetProcessId(config.targetProcessId),
+		takeFocus(config.takeFocus),
+		transparentBackground(config.transparentBackground)
 	{
+		// If overlay mode, try to find target window if not already specified
+		if (isOverlay && !targetWindow) {
+			targetWindow = FindTargetWindow();
+			if (!targetWindow) {
+				std::cerr << "Warning: Could not find target window for overlay" << std::endl;
+				// Continue with normal window creation if target not found
+				isOverlay = false;
+			}
+		}
+
 		// Register window class
 		WNDCLASS wc = {};
 		wc.lpfnWndProc = WndProc;
@@ -155,17 +247,39 @@ public:
 #endif
 		RegisterClass(&wc);
 
-		// Create window
+		// Create window with appropriate styles for overlay or normal window
 		HWND hWnd = nullptr;
+		DWORD windowStyle = isOverlay ? WS_POPUP : WS_OVERLAPPEDWINDOW;
+		DWORD exStyle = 0;
+		
+		if (isOverlay) {
+			exStyle = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
+			if (!takeFocus) {
+				exStyle |= WS_EX_TRANSPARENT;
+			}
+		}
+
+		// Get target window position and size for overlay
+		int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
+		if (isOverlay && targetWindow) {
+			RECT targetRect;
+			if (GetWindowRect(targetWindow, &targetRect)) {
+				x = targetRect.left;
+				y = targetRect.top;
+				width = targetRect.right - targetRect.left;
+				height = targetRect.bottom - targetRect.top;
+			}
+		}
+
 #ifdef UNICODE
 		wchar_t wTitle[256];
 		swprintf(wTitle, 256, L"%hs", title);
-		hWnd = CreateWindow(wClassName, wTitle, WS_OVERLAPPEDWINDOW,
-			CW_USEDEFAULT, CW_USEDEFAULT, width, height,
+		hWnd = CreateWindowEx(exStyle, wClassName, wTitle, windowStyle,
+			x, y, width, height,
 			NULL, NULL, GetModuleHandle(NULL), NULL);
 #else
-		hWnd = CreateWindow(className, title, WS_OVERLAPPEDWINDOW,
-			CW_USEDEFAULT, CW_USEDEFAULT, width, height,
+		hWnd = CreateWindowEx(exStyle, className, title, windowStyle,
+			x, y, width, height,
 			NULL, NULL, GetModuleHandle(NULL), NULL);
 #endif
 
@@ -174,8 +288,15 @@ public:
 		this->hWnd = hWnd;
 		this->hInstance = GetModuleHandle(NULL);
 
+		// Set up layered window attributes for overlay
+		if (isOverlay) {
+			// Set transparency
+			BYTE alpha = transparentBackground ? 200 : 255; // Semi-transparent background
+			SetLayeredWindowAttributes(hWnd, RGB(0, 0, 0), alpha, LWA_ALPHA);
+		}
+
 		// Optionally enable an immersive (e.g., dark mode) titlebar
-		if (useImmersiveTitlebar) {
+		if (useImmersiveTitlebar && !isOverlay) {
 			HKEY hKey = nullptr;
 			if (RegOpenKeyEx(HKEY_CURRENT_USER,
 #ifdef UNICODE
@@ -245,6 +366,12 @@ public:
 
 		context->OMSetRenderTargets(1, &renderTargetView, nullptr);
 
+		// Start tracking thread for overlay mode
+		if (isOverlay && targetWindow) {
+			shouldStopTracking = false;
+			trackingThread = std::thread(&Window::TrackTargetWindow, this);
+		}
+
 		// Notify plugins that the window has loaded
 		for (auto& plugin : plugins)
 			plugin->OnLoad(*this);
@@ -270,6 +397,16 @@ public:
 	std::vector<std::unique_ptr<WBPlugin>> plugins = {};
 	bool useImmersiveTitlebar = false;
 	bool vsync = false; // P953f
+	
+	// Overlay/attach properties
+	bool isOverlay = false;
+	HWND targetWindow = nullptr;
+	const char* targetProcessName = nullptr;
+	DWORD targetProcessId = 0;
+	std::atomic<bool> takeFocus = false;
+	bool transparentBackground = true;
+	std::thread trackingThread;
+	std::atomic<bool> shouldStopTracking = false;
 
 	// Window procedure
 	static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -296,6 +433,131 @@ public:
 	}
 
 private:
+	// Helper methods for overlay functionality
+	HWND FindTargetWindow() {
+		if (targetProcessId != 0) {
+			return FindWindowByProcessId(targetProcessId);
+		}
+		else if (targetProcessName) {
+			return FindWindowByProcessName(targetProcessName);
+		}
+		return nullptr;
+	}
+
+	HWND FindWindowByProcessId(DWORD processId) {
+		struct EnumData {
+			DWORD targetPid;
+			HWND result;
+		};
+		
+		EnumData data = { processId, nullptr };
+		
+		EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+			EnumData* data = reinterpret_cast<EnumData*>(lParam);
+			DWORD pid;
+			GetWindowThreadProcessId(hwnd, &pid);
+			if (pid == data->targetPid && IsWindowVisible(hwnd)) {
+				data->result = hwnd;
+				return FALSE; // Stop enumeration
+			}
+			return TRUE; // Continue enumeration
+		}, reinterpret_cast<LPARAM>(&data));
+		
+		return data.result;
+	}
+
+	HWND FindWindowByProcessName(const char* processName) {
+		// Use NT API to avoid detection
+		HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+		if (!ntdll) return nullptr;
+
+		NtQuerySystemInformation_t NtQuerySystemInformation = 
+			reinterpret_cast<NtQuerySystemInformation_t>(GetProcAddress(ntdll, "NtQuerySystemInformation"));
+		if (!NtQuerySystemInformation) return nullptr;
+
+		ULONG bufferSize = 0x10000;
+		std::vector<BYTE> buffer(bufferSize);
+
+		NTSTATUS status = NtQuerySystemInformation(SystemProcessInformation, 
+			buffer.data(), bufferSize, &bufferSize);
+		
+		if (status == STATUS_INFO_LENGTH_MISMATCH) {
+			buffer.resize(bufferSize);
+			status = NtQuerySystemInformation(SystemProcessInformation, 
+				buffer.data(), bufferSize, &bufferSize);
+		}
+
+		if (status != STATUS_SUCCESS) return nullptr;
+
+		PSYSTEM_PROCESS_INFORMATION processInfo = 
+			reinterpret_cast<PSYSTEM_PROCESS_INFORMATION>(buffer.data());
+
+		while (processInfo->NextEntryOffset != 0) {
+			if (processInfo->ImageName.Buffer) {
+				// Convert UNICODE_STRING to char*
+				int len = WideCharToMultiByte(CP_UTF8, 0, processInfo->ImageName.Buffer, 
+					processInfo->ImageName.Length / sizeof(WCHAR), nullptr, 0, nullptr, nullptr);
+				std::vector<char> processNameBuffer(len + 1);
+				WideCharToMultiByte(CP_UTF8, 0, processInfo->ImageName.Buffer, 
+					processInfo->ImageName.Length / sizeof(WCHAR), 
+					processNameBuffer.data(), len, nullptr, nullptr);
+				processNameBuffer[len] = '\0';
+
+				if (strcmp(processNameBuffer.data(), processName) == 0) {
+					DWORD pid = static_cast<DWORD>(reinterpret_cast<uintptr_t>(processInfo->ProcessId));
+					return FindWindowByProcessId(pid);
+				}
+			}
+
+			processInfo = reinterpret_cast<PSYSTEM_PROCESS_INFORMATION>(
+				reinterpret_cast<BYTE*>(processInfo) + processInfo->NextEntryOffset);
+		}
+
+		return nullptr;
+	}
+
+	void TrackTargetWindow() {
+		RECT lastRect = {};
+		GetWindowRect(targetWindow, &lastRect);
+
+		while (!shouldStopTracking) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60 FPS
+
+			if (!IsWindow(targetWindow)) {
+				// Target window was closed
+				PostMessage(hWnd, WM_CLOSE, 0, 0);
+				break;
+			}
+
+			RECT currentRect;
+			if (GetWindowRect(targetWindow, &currentRect)) {
+				// Check if position or size changed
+				if (memcmp(&lastRect, &currentRect, sizeof(RECT)) != 0) {
+					int newWidth = currentRect.right - currentRect.left;
+					int newHeight = currentRect.bottom - currentRect.top;
+
+					SetWindowPos(hWnd, HWND_TOPMOST,
+						currentRect.left, currentRect.top,
+						newWidth, newHeight,
+						SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+
+					// Update internal size if changed
+					if (newWidth != width || newHeight != height) {
+						width = newWidth;
+						height = newHeight;
+						
+						// Trigger resize handling
+						if (onResize) {
+							onResize(*this);
+						}
+					}
+
+					lastRect = currentRect;
+				}
+			}
+		}
+	}
+
 	// Default callback implementations
 	static void defaultOnResize(Window& window) {
 		if (window.renderTargetView) window.renderTargetView->Release();
@@ -350,6 +612,51 @@ public:
 	}
 	WindowBuilder& VSync(bool vsync = true) { // P8b76
 		config.vsync = vsync;
+		return *this;
+	}
+
+	/// <summary>
+	/// Configures the window to attach to and overlay on top of a target window by handle.
+	/// </summary>
+	/// <param name="targetHwnd">Handle to the target window to overlay</param>
+	/// <param name="takeFocus">Whether the overlay should take focus when clicked (default: false)</param>
+	/// <param name="transparent">Whether the background should be semi-transparent (default: true)</param>
+	/// <returns>WindowBuilder reference for chaining</returns>
+	WindowBuilder& AttachToWindow(HWND targetHwnd, bool takeFocus = false, bool transparent = true) {
+		config.isOverlay = true;
+		config.targetWindow = targetHwnd;
+		config.takeFocus = takeFocus;
+		config.transparentBackground = transparent;
+		return *this;
+	}
+
+	/// <summary>
+	/// Configures the window to attach to and overlay on top of a target process by process ID.
+	/// </summary>
+	/// <param name="processId">Process ID of the target process</param>
+	/// <param name="takeFocus">Whether the overlay should take focus when clicked (default: false)</param>
+	/// <param name="transparent">Whether the background should be semi-transparent (default: true)</param>
+	/// <returns>WindowBuilder reference for chaining</returns>
+	WindowBuilder& AttachToProcess(DWORD processId, bool takeFocus = false, bool transparent = true) {
+		config.isOverlay = true;
+		config.targetProcessId = processId;
+		config.takeFocus = takeFocus;
+		config.transparentBackground = transparent;
+		return *this;
+	}
+
+	/// <summary>
+	/// Configures the window to attach to and overlay on top of a target process by process name.
+	/// </summary>
+	/// <param name="processName">Name of the target process (e.g., "notepad.exe")</param>
+	/// <param name="takeFocus">Whether the overlay should take focus when clicked (default: false)</param>
+	/// <param name="transparent">Whether the background should be semi-transparent (default: true)</param>
+	/// <returns>WindowBuilder reference for chaining</returns>
+	WindowBuilder& AttachToProcessName(const char* processName, bool takeFocus = false, bool transparent = true) {
+		config.isOverlay = true;
+		config.targetProcessName = processName;
+		config.takeFocus = takeFocus;
+		config.transparentBackground = transparent;
 		return *this;
 	}
 
